@@ -1,0 +1,15 @@
+Dependencies
+/node_modules
+
+Environment variables - CRITICAL FOR SECURITY
+This file contains your database password, Cloudinary secrets, and Google Client ID.
+.env
+
+Google Cloud Service Account Key - CRITICAL FOR SECURITY
+This file gives administrative access to your GCP project. NEVER push it.
+serviceAccountKey.json
+
+Logs
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
