@@ -19,11 +19,10 @@ const dbConfig = {
     password: process.env.DB_PASSWORD,
     database: process.env.DB_NAME,
     waitForConnections: true,
-    connectionLimit: 10, // Adjust as needed
+    connectionLimit: 10,
     queueLimit: 0
 };
 
-// --- NEW: Create a connection pool instead of single connections ---
 const pool = mysql.createPool(dbConfig);
 
 cloudinary.config({
@@ -32,21 +31,40 @@ cloudinary.config({
     api_secret: process.env.CLOUDINARY_API_SECRET,
 });
 
-// --- UPDATED MIDDLEWARE to use the connection pool ---
+// --- FUNCTION TO TEST CONNECTIONS ON STARTUP ---
+async function testConnections() {
+    try {
+        const connection = await pool.getConnection();
+        console.log('✅ Google Cloud SQL connection successful!');
+        connection.release();
+    } catch (error) {
+        console.error('❌ Google Cloud SQL connection failed:', error.message);
+    }
+    try {
+        const cloudinaryCheck = await cloudinary.api.ping();
+        if (cloudinaryCheck.status === 'ok') {
+            console.log('✅ Cloudinary connection successful!');
+        } else {
+            throw new Error('Cloudinary ping did not return "ok".');
+        }
+    } catch (error) {
+        console.error('❌ Cloudinary connection failed:', error.message);
+    }
+}
+
+// --- MIDDLEWARE ---
 async function verifyToken(req, res, next) {
     const authHeader = req.headers.authorization;
     if (!authHeader || !authHeader.startsWith('Bearer ')) {
         return res.status(403).send('Unauthorized: No token provided');
     }
     const idToken = authHeader.split('Bearer ')[1];
-    let connection; // Define connection here to use in finally block
+    let connection;
     try {
         const ticket = await client.verifyIdToken({ idToken, audience: GOOGLE_CLIENT_ID });
         const payload = ticket.getPayload();
-        
-        connection = await pool.getConnection(); // Get a connection from the pool
+        connection = await pool.getConnection();
         const [rows] = await connection.execute('SELECT role FROM students WHERE email = ?', [payload.email]);
-        
         req.user = {
             email: payload.email,
             name: payload.name,
@@ -58,11 +76,10 @@ async function verifyToken(req, res, next) {
         console.error("Token verification or role fetch failed:", error);
         res.status(403).send('Unauthorized: Invalid token');
     } finally {
-        if (connection) connection.release(); // IMPORTANT: Release the connection back to the pool
+        if (connection) connection.release();
     }
 }
 
-// ... (isAdmin, multer, etc. remain the same)
 const isAdmin = (req, res, next) => {
     if (req.user && req.user.role === 'admin') {
         next();
@@ -70,12 +87,11 @@ const isAdmin = (req, res, next) => {
         res.status(403).send('Forbidden: This resource requires admin privileges.');
     }
 };
+
 const storage = multer.memoryStorage();
 const upload = multer({ storage });
 
-
-// --- ALL API ENDPOINTS UPDATED to use the pool ---
-
+// --- PUBLIC & USER API ENDPOINTS ---
 app.get('/api/public/profiles', async (req, res) => {
     let connection;
     try {
@@ -108,7 +124,6 @@ app.get('/api/profiles/me', verifyToken, async (req, res) => {
 });
 
 app.put('/api/profiles/me', verifyToken, upload.single('photo'), async (req, res) => {
-    // ... (rest of the logic is the same, just wrapped in connection handling)
     const { name, specialization, skills, github, linkedin, portfolio } = req.body;
     let photo_url = req.body.existing_photo_url;
     let connection;
@@ -137,6 +152,7 @@ app.put('/api/profiles/me', verifyToken, upload.single('photo'), async (req, res
     }
 });
 
+// --- ADMIN API ENDPOINTS ---
 app.get('/api/profiles', verifyToken, isAdmin, async (req, res) => {
     let connection;
     try {
@@ -151,8 +167,73 @@ app.get('/api/profiles', verifyToken, isAdmin, async (req, res) => {
     }
 });
 
-// ... (wrap your other admin POST, PUT, DELETE endpoints in the same try/catch/finally with connection.release())
+app.post('/api/profiles', verifyToken, isAdmin, upload.single('photo'), async (req, res) => {
+    const { name, email, specialization, skills, github, linkedin, portfolio, role = 'student' } = req.body;
+    if (!req.file || !email) {
+        return res.status(400).json({ error: 'Photo and email are required.' });
+    }
+    let connection;
+    try {
+        const b64 = Buffer.from(req.file.buffer).toString("base64");
+        const dataURI = `data:${req.file.mimetype};base64,${b64}`;
+        const result = await cloudinary.uploader.upload(dataURI, { folder: "student_profiles" });
+        
+        connection = await pool.getConnection();
+        const sql = 'INSERT INTO students (name, email, specialization, skills, github, linkedin, portfolio, photo_url, role) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)';
+        const [insertResult] = await connection.execute(sql, [name, email, specialization, skills, github, linkedin, portfolio, result.secure_url, role]);
+        res.status(201).json({ id: insertResult.insertId, message: 'Profile created successfully' });
+    } catch (error) {
+        console.error("Admin Create Profile Error:", error);
+        res.status(500).json({ error: 'Failed to create profile' });
+    } finally {
+        if (connection) connection.release();
+    }
+});
 
+app.put('/api/profiles/:id', verifyToken, isAdmin, upload.single('photo'), async (req, res) => {
+    const { id } = req.params;
+    const { name, email, specialization, skills, github, linkedin, portfolio, role } = req.body;
+    let photo_url = req.body.existing_photo_url;
+    let connection;
+    try {
+        if (req.file) {
+            const b64 = Buffer.from(req.file.buffer).toString("base64");
+            const dataURI = `data:${req.file.mimetype};base64,${b64}`;
+            const result = await cloudinary.uploader.upload(dataURI, { folder: "student_profiles" });
+            photo_url = result.secure_url;
+        }
+        connection = await pool.getConnection();
+        const sql = 'UPDATE students SET name = ?, email = ?, specialization = ?, skills = ?, github = ?, linkedin = ?, portfolio = ?, photo_url = ?, role = ? WHERE id = ?';
+        await connection.execute(sql, [name, email, specialization, skills, github, linkedin, portfolio, photo_url, role, id]);
+        res.json({ message: 'Profile updated successfully' });
+    } catch (error) {
+        console.error("Admin Update Profile Error:", error);
+        res.status(500).json({ error: 'Failed to update profile' });
+    } finally {
+        if (connection) connection.release();
+    }
+});
+
+app.delete('/api/profiles/:id', verifyToken, isAdmin, async (req, res) => {
+    const { id } = req.params;
+    let connection;
+    try {
+        connection = await pool.getConnection();
+        await connection.execute('DELETE FROM students WHERE id = ?', [id]);
+        res.json({ message: 'Profile deleted successfully' });
+    } catch (error) {
+        console.error("Admin Delete Profile Error:", error);
+        res.status(500).json({ error: 'Failed to delete profile' });
+    } finally {
+        if (connection) connection.release();
+    }
+});
+
+
+// --- START SERVER ---
 const PORT = process.env.PORT || 5000;
-app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+app.listen(PORT, () => {
+    console.log(`Server running on port ${PORT}`);
+    testConnections();
+});
 
